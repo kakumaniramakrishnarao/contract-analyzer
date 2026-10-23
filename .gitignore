@@ -1,11 +1,20 @@
 # Python
 backend/venv/
-backend/__pycache__/
-backend/.env
-backend/uploads/
+__pycache__/
 *.pyc
+.pytest_cache/
+
+# Backend runtime data
+backend/data/
+backend/.env
 
 # Node
 frontend/node_modules/
-frontend/.env
 frontend/dist/
+frontend/.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

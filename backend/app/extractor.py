@@ -1,10 +1,8 @@
+import io
 import re
+
 import pdfplumber
 from docx import Document
-
-
-# ── In-memory store: doc_id → cleaned text ──────────────────────────────────
-extracted_texts: dict[str, str] = {}
 
 
 # ── Shared cleaning function ─────────────────────────────────────────────────
@@ -14,7 +12,6 @@ def _clean_text(raw: str) -> str:
     - Excessive blank lines (more than 2 in a row)
     - Trailing whitespace on each line
     - Page number artefacts like "Page 1 of 10" or standalone digits
-    - Common header/footer noise (e.g. "CONFIDENTIAL")
     """
     # Remove "Page X of Y" patterns
     text = re.sub(r"page\s+\d+\s+of\s+\d+", "", raw, flags=re.IGNORECASE)
@@ -32,31 +29,29 @@ def _clean_text(raw: str) -> str:
 
 
 # ── PDF extraction ────────────────────────────────────────────────────────────
-def _extract_pdf(file_path: str) -> str:
+def _extract_pdf(data: bytes) -> str:
     """
-    Uses pdfplumber to extract text page by page.
-    Inserts a page marker between pages so the LLM
-    knows where one page ends and the next begins.
+    Extracts text page by page and inserts a [Page N] marker before each page,
+    so answers can point back to where a clause is.
     """
     pages = []
 
-    with pdfplumber.open(file_path) as pdf:
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
             page_text = page.extract_text()
-            if page_text:
+            if page_text and page_text.strip():
                 pages.append(f"[Page {i}]\n{page_text}")
 
     return "\n\n".join(pages)
 
 
 # ── DOCX extraction ───────────────────────────────────────────────────────────
-def _extract_docx(file_path: str) -> str:
+def _extract_docx(data: bytes) -> str:
     """
-    Uses python-docx to extract paragraphs.
-    Headings are prefixed with ### so structure is preserved.
-    Empty paragraphs are skipped.
+    Extracts paragraphs and table cells. Headings are prefixed with ###
+    so structure is preserved. Empty paragraphs are skipped.
     """
-    doc = Document(file_path)
+    doc = Document(io.BytesIO(data))
     lines = []
 
     for para in doc.paragraphs:
@@ -64,39 +59,28 @@ def _extract_docx(file_path: str) -> str:
         if not text:
             continue
 
-        # Preserve heading hierarchy
         if para.style.name.startswith("Heading"):
             lines.append(f"### {text}")
         else:
             lines.append(text)
 
+    # Fee schedules etc. often live in tables
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                lines.append(" | ".join(cells))
+
     return "\n\n".join(lines)
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
-def extract_and_store(doc_id: str, file_path: str, ext: str) -> str:
-    """
-    Called by the extract endpoint.
-    Picks the right extractor, cleans the output,
-    stores it in memory, and returns the cleaned text.
-    """
+def extract_text(data: bytes, ext: str) -> str:
     if ext == ".pdf":
-        raw = _extract_pdf(file_path)
+        raw = _extract_pdf(data)
     elif ext == ".docx":
-        raw = _extract_docx(file_path)
+        raw = _extract_docx(data)
     else:
         raise ValueError(f"Unsupported file type: {ext}")
 
-    cleaned = _clean_text(raw)
-    extracted_texts[doc_id] = cleaned
-    return cleaned
-
-
-# ── Integration point for Stage 5 (LangChain pipeline) ───────────────────────
-def get_extracted_text(doc_id: str) -> str | None:
-    """
-    Called by the LangChain analysis pipeline.
-    Returns cleaned text for a given doc_id, or None if not found.
-    This is the single swap point when Stage 4 → Stage 5 handoff happens.
-    """
-    return extracted_texts.get(doc_id)
+    return _clean_text(raw)

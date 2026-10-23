@@ -1,109 +1,80 @@
-import os
+import logging
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.concurrency import run_in_threadpool
 
-from app.config import MAX_FILE_SIZE_MB, UPLOAD_DIR, ALLOWED_EXTENSIONS
-from app.extractor import extract_and_store
+from app import config, store
+from app.extractor import extract_text
+
+log = logging.getLogger(__name__)
 
 router = APIRouter()
-
-# In-memory store: doc_id → file info
-uploaded_docs = {}
 
 
 @router.post("/")
 async def upload_file(file: UploadFile = File(...)):
 
     # --- Guard 1: File type check ---
-    ext = Path(file.filename).suffix.lower()
-    if ext not in ALLOWED_EXTENSIONS:
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in config.ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid file type '{ext}'. Only PDF and DOCX are allowed."
         )
 
-    # --- Guard 2: Read file into memory ---
-    contents = await file.read()
-
-    # --- Guard 3: Empty file check ---
-    if len(contents) == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty."
-        )
-
-    # --- Guard 4: Size limit check ---
-    max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+    # --- Guard 2: Size limit (read one byte past the limit so huge files stop early) ---
+    max_bytes = config.MAX_FILE_SIZE_MB * 1024 * 1024
+    contents = await file.read(max_bytes + 1)
     if len(contents) > max_bytes:
         raise HTTPException(
             status_code=400,
-            detail=f"File too large. Maximum allowed size is {MAX_FILE_SIZE_MB}MB."
+            detail=f"File too large. Maximum allowed size is {config.MAX_FILE_SIZE_MB}MB."
         )
 
-    # --- Assign unique doc_id ---
-    doc_id = str(uuid.uuid4())
+    # --- Guard 3: Empty file check ---
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-    # --- Save file to disk ---
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    save_path = os.path.join(UPLOAD_DIR, f"{doc_id}{ext}")
-
-    with open(save_path, "wb") as f:
-        f.write(contents)
-
-    # --- Store mapping in memory ---
-    uploaded_docs[doc_id] = {
-        "filename": file.filename,
-        "path":     save_path,
-        "ext":      ext
-    }
-
-    return JSONResponse(
-        status_code=200,
-        content={
-            "success":  True,
-            "doc_id":   doc_id,
-            "filename": file.filename,
-            "size_kb":  round(len(contents) / 1024, 2),
-            "message":  "File uploaded successfully."
-        }
-    )
-
-
-@router.post("/{doc_id}/extract")
-async def extract_text(doc_id: str):
-
-    # --- Check doc_id exists ---
-    if doc_id not in uploaded_docs:
+    # --- Guard 4: Contents must match the extension, not just the name ---
+    if not contents.startswith(config.FILE_SIGNATURES[ext]):
         raise HTTPException(
-            status_code=404,
-            detail=f"No document found for doc_id: {doc_id}"
+            status_code=400,
+            detail=f"This doesn't look like a real {ext[1:].upper()} file."
         )
 
-    doc_info = uploaded_docs[doc_id]
-
-    # --- Run extraction ---
+    # --- Extract text (CPU-bound, keep it off the event loop) ---
     try:
-        cleaned_text = extract_and_store(
-            doc_id=doc_id,
-            file_path=doc_info["path"],
-            ext=doc_info["ext"]
-        )
-    except Exception as e:
+        text = await run_in_threadpool(extract_text, contents, ext)
+    except Exception:
+        log.exception("Extraction failed for %s", file.filename)
         raise HTTPException(
-            status_code=500,
-            detail=f"Extraction failed: {str(e)}"
+            status_code=400,
+            detail="Couldn't read this file. It may be corrupted or password-protected."
         )
 
-    return JSONResponse(
-        status_code=200,
-        content={
-            "success":    True,
-            "doc_id":     doc_id,
-            "char_count": len(cleaned_text),
-            "preview":    cleaned_text[:300],
-            "message":    "Text extracted successfully."
-        }
-    )
+    if not text.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="No readable text found. Scanned PDFs aren't supported."
+        )
+
+    doc_id = str(uuid.uuid4())
+    truncated = len(text) > config.MAX_CONTEXT_CHARS
+
+    store.save(doc_id, {
+        "filename":  file.filename,
+        "text":      text,
+        "truncated": truncated,
+        "analysis":  None,
+    })
+
+    return {
+        "success":    True,
+        "doc_id":     doc_id,
+        "filename":   file.filename,
+        "size_kb":    round(len(contents) / 1024, 2),
+        "char_count": len(text),
+        "truncated":  truncated,
+    }
