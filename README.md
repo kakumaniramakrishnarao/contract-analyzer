@@ -200,7 +200,6 @@ contract-analyzer/
 
 - **No OCR.** Scanned PDFs, which are just images of text, are rejected at upload with a clear message.
 - **Very long contracts** (over ~120k characters) are cut off before analysis. The analysis page shows a warning when this happens.
-- **Single user, local only.** There are no accounts. Anyone who can reach the backend can open a document if they know its ID.
 - **Risk scores are a judgement call** by the model and can shift slightly between runs.
 - **Not legal advice.** It's a fast way to find the parts of a contract worth a closer look, not a replacement for a lawyer.
 
